@@ -64,10 +64,11 @@ func Subscribe(t ticker.Ticker, providers ...priceprovider.PriceStreamSubscriber
 }
 
 // nextInterval returns start time for the current bar and duration to the end of this bar.
-func nextInterval() (currentTick time.Time, wait time.Duration) {
+func nextInterval() (currentTick time.Time, nextTick time.Time, wait time.Duration) {
 	now := time.Now()
 	currentTick = now.Truncate(barInterval)
-	wait = currentTick.Add(barInterval).Sub(now)
+	nextTick = currentTick.Add(barInterval)
+	wait = nextTick.Sub(now)
 	return
 }
 
@@ -86,37 +87,55 @@ func IndexPrice(subscription Subscription) Subscription {
 		// Let's wait until the next interval.
 		// Values for the current interval might be waiting in the channel already, but they'll be filtered.
 		// We might also get them from the channel and just discard.
-		_, wait := nextInterval()
+		_, _, wait := nextInterval()
 		<-time.After(wait)
 
-		currentTick, wait := nextInterval()
+		currentTick, nextTick, wait := nextInterval()
 		t := time.NewTimer(wait)
+
+		timerHandler := func() {
+			s.updates <- ticker.Bar{
+				Ticker: s.ticker,
+				Time:   currentTick,
+				Price:  averagePrice(values[currentTick]),
+			}
+			delete(values, currentTick)
+
+			currentTick, nextTick, wait = nextInterval()
+			t.Reset(wait)
+		}
 
 		for {
 			select {
+			// If the timer fires, we will handle it after at most one iteration which is ok in our case.
 			case <-t.C:
-				s.updates <- ticker.Bar{
-					Ticker: s.ticker,
-					Time:   currentTick,
-					Price:  averagePrice(values[currentTick]),
-				}
-				delete(values, currentTick)
-
-				currentTick, wait = nextInterval()
-				t.Reset(wait)
-			case value, ok := <-stream:
-				if !ok {
-					close(s.updates)
-					if !t.Stop() {
-						<-t.C
+				timerHandler()
+			default:
+				select {
+				case <-t.C:
+					timerHandler()
+				case value, ok := <-stream:
+					if !ok {
+						close(s.updates)
+						if !t.Stop() {
+							<-t.C
+						}
+						return
 					}
-					return
-				}
-				// If we get outdated values, we just ignore them because we try to provide data in real time.
-				// If we get data for the next interval (that might be in case of very dense price stream),
-				// we preserve them, but do not consider in the current interval, though in the next one we do.
-				if !value.Time.Before(currentTick) {
-					values[currentTick] = append(values[currentTick], &value)
+					// If we get outdated values, we just ignore them because we try to provide data in real time.
+					// If we get data for the next interval (price came in channel earlier than timer fired),
+					// we preserve them, but do not consider in the current interval, though in the next one we do.
+					if !value.Time.Before(currentTick) {
+						if value.Time.Before(nextTick) {
+							values[currentTick] = append(values[currentTick], &value)
+						} else {
+							if value.Time.Before(nextTick.Add(barInterval)) {
+								values[nextTick] = append(values[nextTick], &value)
+							} else {
+								// I have no idea how did we get here.
+							}
+						}
+					}
 				}
 			}
 		}
